@@ -1021,14 +1021,8 @@ def _get_reserved_col_names(args):
     (pandas series type).
     """
     df = args["data_frame"]
-    index = (
-        df.to_native().index
-        if (
-            nw.dependencies.is_pandas_like_dataframe(df.to_native())
-            or nw.dependencies.is_pandas_like_series(df.to_native())
-        )
-        else None
-    )
+
+    index = nw.maybe_get_index(df)
     reserved_names = set()
     for field in args:
         if field not in all_attrables:
@@ -1060,7 +1054,9 @@ def _is_col_list(columns, arg):
     """
     if arg is None or isinstance(arg, str) or isinstance(arg, int):
         return False
-    if isinstance(arg, pd.MultiIndex):
+    if (pd := nw.dependencies.get_pandas()) is not None and isinstance(
+        arg, pd.MultiIndex
+    ):
         return False  # just to keep existing behaviour for now
     try:
         iter(arg)
@@ -1431,7 +1427,24 @@ def build_dataframe(args, constructor):
             )
         if df_provided and no_x and no_y:
             wide_mode = True
+            if (pd := nw.dependencies.get_pandas()) is not None and isinstance(
+                columns, pd.MultiIndex
+            ):
+                raise TypeError(
+                    "Data frame columns is a pandas MultiIndex. "
+                    "pandas MultiIndex is not supported by plotly express "
+                    "at the moment."
+                )
+            elif (pd := nw.dependencies.get_pandas()) is not None and isinstance(
+                columns, pd.Index
+            ):
+                # TODO: push this above, at this point we lose the pd.Index info as columns will be either a list or None
+                var_name = columns.name
+            else:
+                var_name = None
+
             args["wide_variable"] = columns
+
             if var_name in [None, "value", "index"] or var_name in columns:
                 var_name = "variable"
             if constructor == go.Funnel:
@@ -1465,15 +1478,7 @@ def build_dataframe(args, constructor):
         var_name = _escape_col_name(columns, var_name, [])
 
     df_input = args["data_frame"]  # TODO: What if not provided?!
-    index = (
-        df_input.to_native().index
-        if df_provided
-        and (
-            nw.dependencies.is_pandas_like_dataframe(df_input.to_native())
-            or nw.dependencies.is_pandas_like_series(df_input.to_native())
-        )
-        else None
-    )
+    index = nw.maybe_get_index(df_input) if df_provided else None
 
     missing_bar_dim = None
     if (
@@ -1642,7 +1647,9 @@ def _check_dataframe_all_leaves(df: nw.DataFrame):
         }
     )
     row_strings = reduce(
-        lambda x, y: x + y, [df_sorted.get_column(c) for c in cols], ""
+        lambda x, y: x + y,
+        [df_sorted.get_column(c).cast(nw.String()) for c in cols],
+        "",
     )
     for i, row in enumerate(row_strings[:-1]):
         if row_strings[i + 1] in row and (i + 1) in null_indices:
@@ -1662,17 +1669,20 @@ def process_dataframe_hierarchy(args):
     _check_dataframe_all_leaves(df[path[::-1]])
     discrete_color = False
 
-    new_path = []
-    for col_name in path:
-        new_col_name = col_name + "_path_copy"
-        new_path.append(new_col_name)
-        df = df.with_columns(**{new_col_name: nw.col(col_name)})
+    new_path = [col_name + "_path_copy" for col_name in path]
+    df = df.with_columns(
+        **{
+            new_col_name: nw.col(col_name)
+            for new_col_name, col_name in zip(new_path, path)
+        }
+    )
+
     path = new_path
     # ------------ Define aggregation functions --------------------------------
 
     def aggfunc_discrete(x):
-        uniques = x.unique()
-        if len(uniques) == 1:
+        uniques = nw.col(x).unique()
+        if uniques.len() == 1:
             return uniques[0]
         else:
             return "(?)"
@@ -1682,7 +1692,7 @@ def process_dataframe_hierarchy(args):
     if args["values"]:
         try:
             df = df.with_columns(
-                **{args["values"]: nw.col(args["values"]).cast(nw.Float64)}
+                **{args["values"]: nw.col(args["values"]).cast(nw.Float64())}
             )
         except ValueError:
             raise ValueError(
@@ -1705,17 +1715,21 @@ def process_dataframe_hierarchy(args):
             else "".join([str(el) for el in df.columns])
         )
         # we can modify df because it's a copy of the px argument
-        df[count_colname] = 1
+        df = df.with_columns(**{count_colname: nw.lit(1)})
         args["values"] = count_colname
-    agg_f[count_colname] = "sum"
-
+    agg_f[count_colname] = nw.sum(count_colname)
+    discrete_aggs = []
     if args["color"]:
         if not _is_continuous(df, args["color"]):
-            aggfunc_color = aggfunc_discrete
+            aggfunc_color = nw.col(args["color"]).unique()
+            discrete_aggs.append(args["color"])
             discrete_color = True
         else:
 
             def aggfunc_continuous(x):
+                return np.average(
+                    x, weights=df.loc[x.index, count_colname]
+                )  # TODO: Replicate in polars/narwhals
                 return np.average(
                     x, weights=df.filter(x).get_colum(count_colname).to_numpy()
                 )
@@ -1727,43 +1741,52 @@ def process_dataframe_hierarchy(args):
     cols = list(set(df.columns).difference(path))
     for col in cols:  # for hover_data, custom_data etc.
         if col not in agg_f:
-            agg_f[col] = aggfunc_discrete
+            discrete_aggs.append(col)
+            agg_f[col] = nw.col(args[col]).unique()
+
+    # TODO: this block requires some attention
     # Avoid collisions with reserved names - columns in the path have been copied already
     cols = list(set(cols) - set(["labels", "parent", "id"]))
     # ----------------------------------------------------------------------------
-    df_all_trees = pd.DataFrame(columns=["labels", "parent", "id"] + cols)
-    #  Set column type here (useful for continuous vs discrete colorscale)
-    for col in cols:
-        df_all_trees[col] = df_all_trees[col].astype(df[col].dtype)
+    all_trees = []
     for i, level in enumerate(path):
-        df_tree = pd.DataFrame(columns=df_all_trees.columns)
-        dfg = df.groupby(path[i:]).agg(agg_f)
-        dfg = dfg.reset_index()
+
+        # TODO: Fix continuous, fix discrete
+        dfg = df.group_by(path[i:]).agg(agg_f)
+
         # Path label massaging
-        df_tree["labels"] = dfg[level].copy().astype(str)
-        df_tree["parent"] = ""
-        df_tree["id"] = dfg[level].copy().astype(str)
+        df_tree = dfg.copy().select(
+            level=nw.col(level).cast(nw.String()),
+            parent=nw.lit(""),
+            id=nw.col(level).cast(nw.String()),
+        )
         if i < len(path) - 1:
             j = i + 1
             while j < len(path):
-                df_tree["parent"] = (
-                    dfg[path[j]].copy().astype(str) + "/" + df_tree["parent"]
+                df_tree = df_tree.with_columns(
+                    parent=dfg.get_column(path[j]).cast(nw.String())
+                    + "/"
+                    + nw.col("parent"),
+                    id=dfg.get_column(path[j]).cast(nw.String()) + "/" + nw.col("id"),
                 )
-                df_tree["id"] = dfg[path[j]].copy().astype(str) + "/" + df_tree["id"]
                 j += 1
 
-        df_tree["parent"] = df_tree["parent"].str.rstrip("/")
-        if cols:
-            df_tree[cols] = dfg[cols]
-        df_all_trees = pd.concat([df_all_trees, df_tree], ignore_index=True)
+        df_tree["parent"] = df_tree["parent"].str.rstrip(
+            "/"
+        )  # TODO: not available(yet)
+
+        all_trees.append(df_tree.select(*["labels", "parent", "id", *cols]))
+
+    df_all_trees = nw.concat(all_trees, how="vertical")
 
     # we want to make sure than (?) is the first color of the sequence
     if args["color"] and discrete_color:
         sort_col_name = "sort_color_if_discrete_color"
         while sort_col_name in df_all_trees.columns:
             sort_col_name += "0"
-        df_all_trees[sort_col_name] = df[args["color"]].astype(str)
-        df_all_trees = df_all_trees.sort_values(by=sort_col_name)
+        df_all_trees = df_all_trees.with_columns(
+            **{sort_col_name: df[args["color"]].cast(nw.String())}
+        ).sort(by=sort_col_name)
 
     # Now modify arguments
     args["data_frame"] = df_all_trees
