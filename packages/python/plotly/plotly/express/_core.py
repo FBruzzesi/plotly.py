@@ -1,6 +1,7 @@
 import plotly.graph_objs as go
 import plotly.io as pio
 from collections import namedtuple, OrderedDict
+from functools import reduce
 from ._special_inputs import IdentityMap, Constant, Range
 from .trendline_functions import ols, lowess, rolling, expanding, ewm
 
@@ -8,7 +9,7 @@ from _plotly_utils.basevalidators import ColorscaleValidator
 from plotly.colors import qualitative, sequential
 import math
 from packaging import version
-import pandas as pd
+import narwhals.stable.v1 as nw
 import numpy as np
 
 from plotly._subplots import (
@@ -17,9 +18,13 @@ from plotly._subplots import (
     _subplot_type_for_trace_type,
 )
 
-pandas_2_2_0 = version.parse(pd.__version__) >= version.parse("2.2.0")
+pandas_2_2_0 = (pd := nw.dependencies.get_pandas()) is not None and version.parse(
+    pd.__version__
+) >= version.parse("2.2.0")
 
 NO_COLOR = "px_no_color_constant"
+NW_NUMERIC_DTYPES = {nw.Float32, nw.Float64, nw.Int8, nw.Int16, nw.Int32, nw.Int64}
+
 trendline_functions = dict(
     lowess=lowess, rolling=rolling, ewm=ewm, expanding=expanding, ols=ols
 )
@@ -155,7 +160,7 @@ def invert_label(args, column):
 
 
 def _is_continuous(df, col_name):
-    return df[col_name].dtype.kind in "ifc"
+    return df.get_column(col_name).dtype in NW_NUMERIC_DTYPES
 
 
 def get_decorated_label(args, column, role):
@@ -1016,6 +1021,14 @@ def _get_reserved_col_names(args):
     (pandas series type).
     """
     df = args["data_frame"]
+    index = (
+        df.to_native().index
+        if (
+            nw.dependencies.is_pandas_like_dataframe(df.to_native())
+            or nw.dependencies.is_pandas_like_series(df.to_native())
+        )
+        else None
+    )
     reserved_names = set()
     for field in args:
         if field not in all_attrables:
@@ -1028,13 +1041,13 @@ def _get_reserved_col_names(args):
                 continue
             elif isinstance(arg, str):  # no need to add ints since kw arg are not ints
                 reserved_names.add(arg)
-            elif isinstance(arg, pd.Series):
+            elif isinstance(arg, nw.Series):
                 arg_name = arg.name
                 if arg_name and hasattr(df, arg_name):
                     in_df = arg is df[arg_name]
                     if in_df:
                         reserved_names.add(arg_name)
-            elif arg is df.index and arg.name is not None:
+            elif arg is index and arg.name is not None:
                 reserved_names.add(arg.name)
 
     return reserved_names
@@ -1094,7 +1107,16 @@ def to_unindexed_series(x, name=None):
     seems to mangle datetime columns. Stripping the index from existing pd.Series is
     required to get things to match up right in the new DataFrame we're building
     """
-    return pd.Series(x, name=name).reset_index(drop=True)
+    if nw.dependencies.is_pandas_like_series(x):
+        return nw.from_native(
+            x.to_native().rename(name).reset_index(drop=True), series_only=True
+        )
+    elif isinstance(x, nw.Series):
+        return x
+    else:
+        return nw.new_series(
+            name=name, values=x, native_namespace=nw.dependencies.get_pandas()
+        )
 
 
 def process_args_into_dataframe(args, wide_mode, var_name, value_name):
@@ -1125,7 +1147,7 @@ def process_args_into_dataframe(args, wide_mode, var_name, value_name):
                 "No data were provided. Please provide data either with the `data_frame` or with the `dimensions` argument."
             )
         else:
-            df_output = {col: series for col, series in df_input.items()}
+            df_output = {col: df_input.get_column(col) for col in df_input.columns}
 
     # hover_data is a dict
     hover_data_is_dict = (
@@ -1140,7 +1162,11 @@ def process_args_into_dataframe(args, wide_mode, var_name, value_name):
                 args["hover_data"][k] = (True, args["hover_data"][k])
             if not isinstance(args["hover_data"][k], tuple):
                 args["hover_data"][k] = (args["hover_data"][k], None)
-            if df_provided and args["hover_data"][k][1] is not None and k in df_input:
+            if (
+                df_provided
+                and args["hover_data"][k][1] is not None
+                and k in df_input.columns
+            ):
                 raise ValueError(
                     "Ambiguous input: values for '%s' appear both in hover_data and data_frame"
                     % k
@@ -1166,19 +1192,23 @@ def process_args_into_dataframe(args, wide_mode, var_name, value_name):
         # argument_list and field_list ready, iterate over them
         # Core of the loop starts here
         for i, (argument, field) in enumerate(zip(argument_list, field_list)):
-            length = len(df_output[next(iter(df_output))]) if len(df_output) else 0
+            length = (
+                len(df_output[next(iter(df_output))]) if len(df_output) else 0
+            )  # TODO: WTF is going on!
             if argument is None:
                 continue
             col_name = None
             # Case of multiindex
-            if isinstance(argument, pd.MultiIndex):
+            if (pd := nw.dependencies.get_pandas()) is not None and isinstance(
+                argument, pd.MultiIndex
+            ):
                 raise TypeError(
                     "Argument '%s' is a pandas MultiIndex. "
                     "pandas MultiIndex is not supported by plotly express "
                     "at the moment." % field
                 )
             # ----------------- argument is a special value ----------------------
-            if isinstance(argument, Constant) or isinstance(argument, Range):
+            if isinstance(argument, (Constant, Range)):
                 col_name = _check_name_not_reserved(
                     str(argument.label) if argument.label is not None else field,
                     reserved_names,
@@ -1247,13 +1277,13 @@ def process_args_into_dataframe(args, wide_mode, var_name, value_name):
                 else:
                     col_name = str(argument)
                     df_output[col_name] = to_unindexed_series(
-                        df_input[argument], col_name
+                        df_input.get_column(argument), col_name
                     )
             # ----------------- argument is likely a column / array / list.... -------
             else:
                 if df_provided and hasattr(argument, "name"):
-                    if argument is df_input.index:
-                        if argument.name is None or argument.name in df_input:
+                    if argument is nw.maybe_get_index(df_input):
+                        if argument.name is None or argument.name in df_input.columns:
                             col_name = "index"
                         else:
                             col_name = argument.name
@@ -1297,17 +1327,28 @@ def process_args_into_dataframe(args, wide_mode, var_name, value_name):
 
     length = len(df_output[next(iter(df_output))]) if len(df_output) else 0
     df_output.update(
-        {col_name: to_unindexed_series(range(length), col_name) for col_name in ranges}
+        {
+            col_name: nw.new_series(
+                name=col_name,
+                values=range(length),
+                native_namespace=df_input.__native_namespace__(),
+            )
+            for col_name in ranges
+        }
     )
     df_output.update(
         {
             # constant is single value. repeat by len to avoid creating NaN on concating
-            col_name: to_unindexed_series([constants[col_name]] * length, col_name)
+            col_name: nw.new_series(
+                name=col_name,
+                values=[constants[col_name]] * length,
+                native_namespace=df_input.__native_namespace__(),
+            )
             for col_name in constants
         }
     )
 
-    df_output = pd.DataFrame(df_output)
+    df_output = nw.from_dict(df_output)
     return df_output, wide_id_vars
 
 
@@ -1341,39 +1382,34 @@ def build_dataframe(args, constructor):
 
     # Cast data_frame argument to DataFrame (it could be a numpy array, dict etc.)
     df_provided = args["data_frame"] is not None
-    needs_interchanging = False
-    if df_provided and not isinstance(args["data_frame"], pd.DataFrame):
-        if hasattr(args["data_frame"], "__dataframe__") and version.parse(
-            pd.__version__
-        ) >= version.parse("2.0.2"):
-            import pandas.api.interchange
 
-            df_not_pandas = args["data_frame"]
-            args["data_frame"] = df_not_pandas.__dataframe__()
-            # According interchange protocol: `def column_names(self) -> Iterable[str]:`
-            # so this function can return for example a generator.
-            # The easiest way is to convert `columns` to `pandas.Index` so that the
-            # type is similar to the types in other code branches.
-            columns = pd.Index(args["data_frame"].column_names())
-            needs_interchanging = True
-        elif hasattr(args["data_frame"], "to_pandas"):
-            args["data_frame"] = args["data_frame"].to_pandas()
-            columns = args["data_frame"].columns
-        elif hasattr(args["data_frame"], "toPandas"):
-            args["data_frame"] = args["data_frame"].toPandas()
-            columns = args["data_frame"].columns
-        elif hasattr(args["data_frame"], "to_pandas_df"):
-            args["data_frame"] = args["data_frame"].to_pandas_df()
-            columns = args["data_frame"].columns
+    if df_provided:
+        if is_narwhals_eager_dataframe(args["data_frame"]):
+            args["data_frame"] = nw.from_native(
+                args["data_frame"], strict=True, eager_only=True
+            )
         else:
-            args["data_frame"] = pd.DataFrame(args["data_frame"])
-            columns = args["data_frame"].columns
-    elif df_provided:
+            if hasattr(args["data_frame"], "to_pandas"):
+                df_pandas = args["data_frame"].to_pandas()
+            elif hasattr(args["data_frame"], "toPandas"):
+                df_pandas = args["data_frame"].toPandas()
+            elif hasattr(args["data_frame"], "to_pandas_df"):
+                df_pandas = args["data_frame"].to_pandas_df()
+            elif (
+                hasattr(args["data_frame"], "__dataframe__")
+                and (pd := nw.dependencies.get_pandas()) is not None
+                and version.parse(pd.__version__) >= version.parse("2.0.2")
+            ):
+                df_pandas = pd.api.interchange.from_dataframe(args["data_frame"])
+            else:
+                # TODO: Which cases can this work without breaking? A dict?
+                df_pandas = pd.DataFrame(args["data_frame"])
+
+            args["data_frame"] = nw.from_native(df_pandas, strict=True, eager_only=True)
+
         columns = args["data_frame"].columns
     else:
         columns = None
-
-    df_input = args["data_frame"]
 
     # now we handle special cases like wide-mode or x-xor-y specification
     # by rearranging args to tee things up for process_args_into_dataframe to work
@@ -1395,17 +1431,7 @@ def build_dataframe(args, constructor):
             )
         if df_provided and no_x and no_y:
             wide_mode = True
-            if isinstance(columns, pd.MultiIndex):
-                raise TypeError(
-                    "Data frame columns is a pandas MultiIndex. "
-                    "pandas MultiIndex is not supported by plotly express "
-                    "at the moment."
-                )
-            args["wide_variable"] = list(columns)
-            if isinstance(columns, pd.Index):
-                var_name = columns.name
-            else:
-                var_name = None
+            args["wide_variable"] = columns
             if var_name in [None, "value", "index"] or var_name in columns:
                 var_name = "variable"
             if constructor == go.Funnel:
@@ -1418,7 +1444,7 @@ def build_dataframe(args, constructor):
             wide_mode = True
             args["wide_variable"] = args["y"] if wide_y else args["x"]
             if df_provided and args["wide_variable"] is columns:
-                var_name = columns.name
+                var_name = None
             if isinstance(args["wide_variable"], pd.Index):
                 args["wide_variable"] = list(args["wide_variable"])
             if var_name in [None, "value", "index"] or (
@@ -1438,41 +1464,16 @@ def build_dataframe(args, constructor):
         value_name = _escape_col_name(columns, "value", [])
         var_name = _escape_col_name(columns, var_name, [])
 
-    if needs_interchanging:
-        try:
-            if wide_mode or not hasattr(args["data_frame"], "select_columns_by_name"):
-                args["data_frame"] = pd.api.interchange.from_dataframe(
-                    args["data_frame"]
-                )
-            else:
-                # Save precious resources by only interchanging columns that are
-                # actually going to be plotted.
-                necessary_columns = {
-                    i for i in args.values() if isinstance(i, str) and i in columns
-                }
-                for field in args:
-                    if args[field] is not None and field in array_attrables:
-                        necessary_columns.update(i for i in args[field] if i in columns)
-                columns = list(necessary_columns)
-                args["data_frame"] = pd.api.interchange.from_dataframe(
-                    args["data_frame"].select_columns_by_name(columns)
-                )
-        except (ImportError, NotImplementedError) as exc:
-            # temporary workaround; developers of third-party libraries themselves
-            # should try a different implementation, if available. For example:
-            # def __dataframe__(self, ...):
-            #   if not some_condition:
-            #     self.to_pandas(...)
-            if hasattr(df_not_pandas, "toPandas"):
-                args["data_frame"] = df_not_pandas.toPandas()
-            elif hasattr(df_not_pandas, "to_pandas_df"):
-                args["data_frame"] = df_not_pandas.to_pandas_df()
-            elif hasattr(df_not_pandas, "to_pandas"):
-                args["data_frame"] = df_not_pandas.to_pandas()
-            else:
-                raise exc
-
-    df_input = args["data_frame"]
+    df_input = args["data_frame"]  # TODO: What if not provided?!
+    index = (
+        df_input.to_native().index
+        if df_provided
+        and (
+            nw.dependencies.is_pandas_like_dataframe(df_input.to_native())
+            or nw.dependencies.is_pandas_like_series(df_input.to_native())
+        )
+        else None
+    )
 
     missing_bar_dim = None
     if (
@@ -1482,7 +1483,7 @@ def build_dataframe(args, constructor):
         if not wide_mode and (no_x != no_y):
             for ax in ["x", "y"]:
                 if args.get(ax) is None:
-                    args[ax] = df_input.index if df_provided else Range()
+                    args[ax] = index or Range()
                     if constructor == go.Bar:
                         missing_bar_dim = ax
                     else:
@@ -1491,21 +1492,12 @@ def build_dataframe(args, constructor):
         if wide_mode and wide_cross_name is None:
             if no_x != no_y and args["orientation"] is None:
                 args["orientation"] = "v" if no_x else "h"
-            if df_provided:
-                if isinstance(df_input.index, pd.MultiIndex):
-                    raise TypeError(
-                        "Data frame index is a pandas MultiIndex. "
-                        "pandas MultiIndex is not supported by plotly express "
-                        "at the moment."
-                    )
-                args["wide_cross"] = df_input.index
-            else:
-                args["wide_cross"] = Range(
-                    label=_escape_col_name(df_input, "index", [var_name, value_name])
-                )
+            args["wide_cross"] = index or Range(
+                label=_escape_col_name(df_input, "index", [var_name, value_name])
+            )
 
     no_color = False
-    if type(args.get("color")) == str and args["color"] == NO_COLOR:
+    if isinstance(args.get("color"), str) and args["color"] == NO_COLOR:
         no_color = True
         args["color"] = None
     # now that things have been prepped, we do the systematic rewriting of `args`
@@ -1527,7 +1519,7 @@ def build_dataframe(args, constructor):
         other_dim = "x" if missing_bar_dim == "y" else "y"
         if not _is_continuous(df_output, args[other_dim]):
             args[missing_bar_dim] = count_name
-            df_output[count_name] = 1
+            df_output = df_output.with_columns(**{count_name: nw.lit(1)})
         else:
             # on the other hand, if the non-missing dimension is continuous, then we
             # can use this information to override the normal auto-orientation code
@@ -1552,18 +1544,19 @@ def build_dataframe(args, constructor):
         del args["wide_cross"]
         dtype = None
         for v in wide_value_vars:
-            v_dtype = df_output[v].dtype.kind
-            v_dtype = "number" if v_dtype in ["i", "f", "u"] else v_dtype
+            v_dtype = df_output.get_column(v).dtype
+            v_dtype = "number" if v_dtype in NW_NUMERIC_DTYPES else v_dtype
             if dtype is None:
                 dtype = v_dtype
             elif dtype != v_dtype:
                 raise ValueError(
                     "Plotly Express cannot process wide-form data with columns of different type."
                 )
-        df_output = df_output.melt(
-            id_vars=wide_id_vars,
-            value_vars=wide_value_vars,
-            var_name=var_name,
+        # TODO(FBruzzesi): Requires https://github.com/narwhals-dev/narwhals/pull/1043 to be merged and released
+        df_output = df_output.unpivot(
+            index=wide_id_vars,
+            on=wide_value_vars,
+            variable_name=var_name,
             value_name=value_name,
         )
         assert len(df_output.columns) == len(set(df_output.columns)), (
@@ -1572,7 +1565,10 @@ def build_dataframe(args, constructor):
             "https://github.com/plotly/plotly.py/issues/new and we will try to "
             "replicate and fix it."
         )
-        df_output[var_name] = df_output[var_name].astype(str)
+        # TODO(Fbruzzesi): Requires `https://github.com/narwhals-dev/narwhals/pull/1045 to be merged and released
+        # df_output = df_output.cast({var_name: nw.String})
+
+        df_output = df_output.with_columns(nw.col(var_name).cast(nw.String))
         orient_v = wide_orientation == "v"
 
         if hist1d_orientation:
@@ -1594,7 +1590,7 @@ def build_dataframe(args, constructor):
             else:
                 args["x" if orient_v else "y"] = value_name
                 args["y" if orient_v else "x"] = count_name
-                df_output[count_name] = 1
+                df_output = df_output.with_columns(**{count_name: nw.lit(1)})
                 args["color"] = args["color"] or var_name
         elif constructor in [go.Violin, go.Box]:
             args["x" if orient_v else "y"] = wide_cross_name or var_name
@@ -1607,12 +1603,12 @@ def build_dataframe(args, constructor):
             args["histfunc"] = None
             args["orientation"] = "h"
             args["x"] = count_name
-            df_output[count_name] = 1
+            df_output = df_output.with_columns(**{count_name: nw.lit(1)})
         else:
             args["histfunc"] = None
             args["orientation"] = "v"
             args["y"] = count_name
-            df_output[count_name] = 1
+            df_output = df_output.with_columns(**{count_name: nw.lit(1)})
 
     if no_color:
         args["color"] = None
@@ -1620,21 +1616,34 @@ def build_dataframe(args, constructor):
     return args
 
 
-def _check_dataframe_all_leaves(df):
-    df_sorted = df.sort_values(by=list(df.columns))
-    null_mask = df_sorted.isnull()
-    df_sorted = df_sorted.astype(str)
-    null_indices = np.nonzero(null_mask.any(axis=1).values)[0]
+def _check_dataframe_all_leaves(df: nw.DataFrame):
+    cols = df.columns
+    df_sorted = df.sort(by=cols)
+    null_mask = df_sorted.select(*[nw.col(c).is_null() for c in cols])
+    df_sorted = df_sorted.with_columns(*[nw.col(c).cast(nw.String) for c in cols])
+    null_indices = (
+        null_mask.select(null_mask=nw.any_horizontal(nw.col(cols)))
+        .get_column("null_mask")
+        .arg_true()
+    )
     for null_row_index in null_indices:
-        row = null_mask.iloc[null_row_index]
-        i = np.nonzero(row.values)[0][0]
+        row = np.array(null_mask.row(null_row_index))
+
+        i = np.nonzero(row)[0][0]
         if not row[i:].all():
             raise ValueError(
                 "None entries cannot have not-None children",
-                df_sorted.iloc[null_row_index],
+                df_sorted.row(null_row_index),
             )
-    df_sorted[null_mask] = ""
-    row_strings = list(df_sorted.apply(lambda x: "".join(x), axis=1))
+    df_sorted = df_sorted.with_columns(
+        **{
+            c: df_sorted.get_column(c).zip_with(null_mask.get_column(c), nw.lit(""))
+            for c in cols
+        }
+    )
+    row_strings = reduce(
+        lambda x, y: x + y, [df_sorted.get_column(c) for c in cols], ""
+    )
     for i, row in enumerate(row_strings[:-1]):
         if row_strings[i + 1] in row and (i + 1) in null_indices:
             raise ValueError(
@@ -1657,7 +1666,7 @@ def process_dataframe_hierarchy(args):
     for col_name in path:
         new_col_name = col_name + "_path_copy"
         new_path.append(new_col_name)
-        df[new_col_name] = df[col_name]
+        df = df.with_columns(**{new_col_name: nw.col(col_name)})
     path = new_path
     # ------------ Define aggregation functions --------------------------------
 
@@ -1672,7 +1681,9 @@ def process_dataframe_hierarchy(args):
     aggfunc_color = None
     if args["values"]:
         try:
-            df[args["values"]] = pd.to_numeric(df[args["values"]])
+            df = df.with_columns(
+                **{args["values"]: nw.col(args["values"]).cast(nw.Float64)}
+            )
         except ValueError:
             raise ValueError(
                 "Column `%s` of `df` could not be converted to a numerical data type."
@@ -1682,7 +1693,7 @@ def process_dataframe_hierarchy(args):
         if args["color"]:
             if args["color"] == args["values"]:
                 new_value_col_name = args["values"] + "_sum"
-                df[new_value_col_name] = df[args["values"]]
+                df = df.with_columns(**{new_value_col_name: nw.col(args["values"])})
                 args["values"] = new_value_col_name
         count_colname = args["values"]
     else:
@@ -1691,7 +1702,7 @@ def process_dataframe_hierarchy(args):
         count_colname = (
             "count"
             if "count" not in df.columns
-            else "".join([str(el) for el in list(df.columns)])
+            else "".join([str(el) for el in df.columns])
         )
         # we can modify df because it's a copy of the px argument
         df[count_colname] = 1
@@ -1705,7 +1716,9 @@ def process_dataframe_hierarchy(args):
         else:
 
             def aggfunc_continuous(x):
-                return np.average(x, weights=df.loc[x.index, count_colname])
+                return np.average(
+                    x, weights=df.filter(x).get_colum(count_colname).to_numpy()
+                )
 
             aggfunc_color = aggfunc_continuous
         agg_f[args["color"]] = aggfunc_color
@@ -1819,7 +1832,9 @@ def infer_config(args, constructor, trace_patch, layout_patch):
     # Compute sizeref
     sizeref = 0
     if "size" in args and args["size"]:
-        sizeref = args["data_frame"][args["size"]].max() / args["size_max"] ** 2
+        sizeref = (
+            args["data_frame"].get_columns(args["size"]).max() / args["size_max"] ** 2
+        )
 
     # Compute color attributes and grouping attributes
     if "color" in args:
@@ -1991,7 +2006,7 @@ def infer_config(args, constructor, trace_patch, layout_patch):
         args[other_position] = None
 
     # Ignore facet rows and columns when data frame is empty so as to prevent nrows/ncols equaling 0
-    if len(args["data_frame"]) == 0:
+    if args["data_frame"].is_empty():
         args["facet_row"] = args["facet_col"] = None
 
     # If both marginals and faceting are specified, faceting wins
@@ -2508,3 +2523,12 @@ Use the {facet_arg} argument to adjust this spacing.""".format(
         annot.update(font=None)
 
     return fig
+
+
+def is_narwhals_eager_dataframe(df) -> bool:
+    """Check if `df` is a supported narwhals eager dataframe."""
+    return (
+        nw.dependencies.is_polars_dataframe(df)
+        or nw.dependencies.is_pyarrow_table(df)
+        or nw.dependencies.is_pandas_like_dataframe(df)
+    )
