@@ -10,6 +10,7 @@ from plotly.colors import qualitative, sequential
 import math
 from packaging import version
 import narwhals.stable.v1 as nw
+from narwhals.utils import generate_unique_token
 import numpy as np
 
 from plotly._subplots import (
@@ -1518,7 +1519,7 @@ def build_dataframe(args, constructor):
     df_output, wide_id_vars = process_args_into_dataframe(
         args, wide_mode, var_name, value_name
     )
-
+    df_output: nw.DataFrame
     # now that `df_output` exists and `args` contains only references, we complete
     # the special-case and wide-mode handling by further rewriting args and/or mutating
     # df_output
@@ -1578,9 +1579,6 @@ def build_dataframe(args, constructor):
             "https://github.com/plotly/plotly.py/issues/new and we will try to "
             "replicate and fix it."
         )
-        # TODO(Fbruzzesi): Requires `https://github.com/narwhals-dev/narwhals/pull/1045 to be merged and released
-        # df_output = df_output.cast({var_name: nw.String})
-
         df_output = df_output.with_columns(nw.col(var_name).cast(nw.String))
         orient_v = wide_orientation == "v"
 
@@ -1704,11 +1702,10 @@ def process_dataframe_hierarchy(args):
                 % args["values"]
             )
 
-        if args["color"]:
-            if args["color"] == args["values"]:
-                new_value_col_name = args["values"] + "_sum"
-                df = df.with_columns(**{new_value_col_name: nw.col(args["values"])})
-                args["values"] = new_value_col_name
+        if args["color"] and args["color"] == args["values"]:
+            new_value_col_name = args["values"] + "_sum"
+            df = df.with_columns(**{new_value_col_name: nw.col(args["values"])})
+            args["values"] = new_value_col_name
         count_colname = args["values"]
     else:
         # we need a count column for the first groupby and the weighted mean of color
@@ -1731,11 +1728,11 @@ def process_dataframe_hierarchy(args):
         else:
 
             def aggfunc_continuous(x):
-                # TODO: Make this as an expression
-                return np.average(x, weights=df.loc[x.index, count_colname])
+                # TODO: Can this be made into a simple expression?
+                return (nw.col(x) * nw.col(count_colname)).sum() / nw.sum(count_colname)
                 return np.average(
-                    x, weights=df.filter(x).get_colum(count_colname).to_numpy()
-                )
+                    x, weights=df.loc[x.index, count_colname]
+                )  # Original function
 
             aggfunc_color = aggfunc_continuous
         agg_f[args["color"]] = aggfunc_color
@@ -1747,7 +1744,6 @@ def process_dataframe_hierarchy(args):
             discrete_aggs.append(col)
             agg_f[col] = aggfunc_discrete(args[col])
 
-    # TODO: this block requires some attention
     # Avoid collisions with reserved names - columns in the path have been copied already
     cols = list(set(cols) - set(["labels", "parent", "id"]))
     # ----------------------------------------------------------------------------
@@ -1763,7 +1759,7 @@ def process_dataframe_hierarchy(args):
         #     return "(?)"
 
         # Path label massaging
-        df_tree = dfg.clone().select(  # TODO: Is `clone()` needed?
+        df_tree = dfg.clone().select(
             level=nw.col(level).cast(nw.String()),
             parent=nw.lit(""),
             id=nw.col(level).cast(nw.String()),
@@ -1771,17 +1767,21 @@ def process_dataframe_hierarchy(args):
         if i < len(path) - 1:
             j = i + 1
             while j < len(path):
+                path_j_col = dfg.get_column(path[j]).cast(nw.String())
+
                 df_tree = df_tree.with_columns(
-                    parent=dfg.get_column(path[j]).cast(nw.String())
-                    + "/"
-                    + nw.col("parent"),
-                    id=dfg.get_column(path[j]).cast(nw.String()) + "/" + nw.col("id"),
+                    **{
+                        "parent": path_j_col + "/" + nw.col("parent"),
+                        "id": path_j_col + "/" + nw.col("id"),
+                    }
                 )
                 j += 1
 
-        df_tree["parent"] = df_tree["parent"].str.rstrip(
-            "/"
-        )  #  TODO: not available(yet)
+        df_tree = df_tree.with_columns(
+            parent=nw.col("parent").str.replace(
+                "/?$", ""
+            )  # strip "/" if at the end of the string
+        )
 
         all_trees.append(df_tree.select(*["labels", "parent", "id", *cols]))
 
@@ -1836,12 +1836,17 @@ def process_dataframe_timeline(args):
     #     "timedelta64[ns]"
     # ) / np.timedelta64(1, "ms")
 
-    # TODO: Does this work for all backends?
-    df = df.with_columns(
-        **{
-            args["x_end"]: (x_end - x_start).cast(nw.Duration("ns"))
-            / np.timedelta64(1, "ms")
-        }
+    # TODO(FBruzzesi) Requires https://github.com/narwhals-dev/narwhals/pull/960 to be merged and released
+    token = generate_unique_token(8, args["data_frame"].columns)
+    args["data_frame"] = (
+        df.with_columns(
+            **{
+                args["x_end"]: (x_end - x_start).cast(nw.Duration("ns")),
+                token: nw.lit(1).cast(nw.Duration("ms")),
+            }
+        )
+        .with_columns(**{args["x_end"]: nw.col(args["x_end"]) / nw.col(token)})
+        .drop(token)
     )
 
     args["x"] = args["x_end"]
@@ -2131,9 +2136,7 @@ def get_groups_and_orders(args, grouper):
         groups = {tuple(single_group_name): df}
     else:
         required_grouper = [g for g in grouper if g != one_group]
-        grouped = dict(
-            df.group_by(required_grouper).__iter__()
-        )  # TODO: may require to have `observed=False` for pandas
+        grouped = dict(df.group_by(required_grouper).__iter__())
         sorted_group_names = list(grouped.keys())
 
         for i, col in reversed(list(enumerate(required_grouper))):
@@ -2150,17 +2153,9 @@ def get_groups_and_orders(args, grouper):
                     g.insert(i, "")
         full_sorted_group_names = [tuple(g) for g in full_sorted_group_names]
 
-        groups = {}
-        for sf, s in zip(full_sorted_group_names, sorted_group_names):
-
-            # TODO: Check consistency we have in narwhals
-            if len(s) > 1:
-                groups[sf] = grouped[s]
-            else:
-                if pandas_2_2_0:
-                    groups[sf] = grouped[(s[0],)]
-                else:
-                    groups[sf] = grouped[s[0]]
+        groups = {
+            sf: grouped[s] for sf, s in zip(full_sorted_group_names, sorted_group_names)
+        }
     return groups, orders
 
 
@@ -2345,7 +2340,6 @@ def make_figure(args, constructor, trace_patch=None, layout_patch=None):
                     group = group.sort(by=base, descending=False)
 
                 if args.get("ecdfmode", "standard") == "complementary":
-                    # TODO: Check if there is issue with having lit on the leftmost side
                     group = group.with_columns(
                         **{var: -nw.col(var) + nw.lit(group_sum)}
                     )
