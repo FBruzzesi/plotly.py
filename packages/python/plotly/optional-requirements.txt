@@ -38,7 +38,7 @@ colorcet
 ipython
 
 ## pandas deps for some matplotlib functionality ##
-narwhals
+narwhals>=1.8.4
 
 ## scipy deps for some FigureFactory functions ##
 scipy

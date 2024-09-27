@@ -10,7 +10,6 @@ from plotly.colors import qualitative, sequential
 import math
 from packaging import version
 import narwhals.stable.v1 as nw
-from narwhals.utils import generate_unique_token
 import numpy as np
 
 from plotly._subplots import (
@@ -19,9 +18,6 @@ from plotly._subplots import (
     _subplot_type_for_trace_type,
 )
 
-pandas_2_2_0 = (pd := nw.dependencies.get_pandas()) is not None and version.parse(
-    pd.__version__
-) >= version.parse("2.2.0")
 
 NO_COLOR = "px_no_color_constant"
 NW_NUMERIC_DTYPES = {nw.Float32, nw.Float64, nw.Int8, nw.Int16, nw.Int32, nw.Int64}
@@ -1197,9 +1193,7 @@ def process_args_into_dataframe(args, wide_mode, var_name, value_name):
         # argument_list and field_list ready, iterate over them
         # Core of the loop starts here
         for i, (argument, field) in enumerate(zip(argument_list, field_list)):
-            length = (
-                len(df_output[next(iter(df_output))]) if len(df_output) else 0
-            )  # TODO: WTF is going on!
+            length = len(df_output[next(iter(df_output))]) if len(df_output) else 0
             if argument is None:
                 continue
             col_name = None
@@ -1407,7 +1401,8 @@ def build_dataframe(args, constructor):
             ):
                 df_pandas = pd.api.interchange.from_dataframe(args["data_frame"])
             else:
-                # TODO: Which cases can this work without breaking? A dict?
+                # Cases in which data_frame can be given as input to dataframe
+                # constructor, e.g. a dict
                 df_pandas = pd.DataFrame(args["data_frame"])
 
             args["data_frame"] = nw.from_native(df_pandas, strict=True, eager_only=True)
@@ -1566,7 +1561,7 @@ def build_dataframe(args, constructor):
                 raise ValueError(
                     "Plotly Express cannot process wide-form data with columns of different type."
                 )
-        # TODO(FBruzzesi): Requires https://github.com/narwhals-dev/narwhals/pull/1043 to be merged and released
+
         df_output = df_output.unpivot(
             index=wide_id_vars,
             on=wide_value_vars,
@@ -1728,7 +1723,7 @@ def process_dataframe_hierarchy(args):
         else:
 
             def aggfunc_continuous(x):
-                # TODO: Can this be made into a simple expression?
+                # TODO: Can this be made into a "simple" expression?
                 return (nw.col(x) * nw.col(count_colname)).sum() / nw.sum(count_colname)
                 return np.average(
                     x, weights=df.loc[x.index, count_colname]
@@ -1837,16 +1832,11 @@ def process_dataframe_timeline(args):
     # ) / np.timedelta64(1, "ms")
 
     # TODO(FBruzzesi) Requires https://github.com/narwhals-dev/narwhals/pull/960 to be merged and released
-    token = generate_unique_token(8, args["data_frame"].columns)
-    args["data_frame"] = (
-        df.with_columns(
-            **{
-                args["x_end"]: (x_end - x_start).cast(nw.Duration("ns")),
-                token: nw.lit(1).cast(nw.Duration("ms")),
-            }
-        )
-        .with_columns(**{args["x_end"]: nw.col(args["x_end"]) / nw.col(token)})
-        .drop(token)
+    args["data_frame"] = df.with_columns(
+        **{
+            args["x_end"]: (x_end - x_start).cast(nw.Duration("ns"))
+            / nw.lit(1).cast(nw.Duration("ms")),
+        }
     )
 
     args["x"] = args["x_end"]
@@ -1866,7 +1856,7 @@ def process_dataframe_pie(args, trace_patch):
     df: nw.DataFrame = args["data_frame"]
     trace_patch["sort"] = False
     trace_patch["direction"] = "clockwise"
-    uniques = list(df[names].unique())  # TODO: Understand what `names` can be
+    uniques = df.get_column(names).unique().to_list()
     order = [x for x in OrderedDict.fromkeys(list(order_in) + uniques) if x in uniques]
     args["data_frame"] = df.select(*[names, *order])
     return args, trace_patch
@@ -2464,7 +2454,8 @@ def make_figure(args, constructor, trace_patch=None, layout_patch=None):
         if fit_results is not None:
             trendline_rows.append(dict(px_fit_results=fit_results))
 
-    fig._px_trendlines = pd.DataFrame(trendline_rows)
+    # TODO: Add trendline_rows
+    # fig._px_trendlines = pd.DataFrame(trendline_rows)
 
     configure_axes(args, constructor, fig, orders)
     configure_animation_controls(args, constructor, fig)
