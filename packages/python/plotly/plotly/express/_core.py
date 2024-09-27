@@ -361,11 +361,7 @@ def make_trace_kwargs(args, trace_spec, trace_data, mapping_labels, sizeref):
                         args["x"]
                     )
                     trendline_function = trendline_functions[attr_value]
-                    (
-                        y_out,
-                        hover_header,
-                        fit_results,
-                    ) = trendline_function(  # TODO: Trendline needs special attention
+                    y_out, hover_header, fit_results = trendline_function(
                         args["trendline_options"],
                         sorted_trace_data.get_column(args["x"]),  # narwhals series
                         x,  # numpy array
@@ -373,6 +369,11 @@ def make_trace_kwargs(args, trace_spec, trace_data, mapping_labels, sizeref):
                         args["x"],
                         args["y"],
                         non_missing,  # numpy array
+                    )
+                    y_out = nw.new_series(
+                        name="",
+                        values=y_out,
+                        native_namespace=sorted_trace_data.__native_namespace__(),
                     )
                     assert len(y_out) == len(
                         trace_patch["x"]
@@ -390,7 +391,7 @@ def make_trace_kwargs(args, trace_spec, trace_data, mapping_labels, sizeref):
                 if len(attr_value) > 0:
                     # here we store a data frame in customdata, and it's serialized
                     # as a list of row lists, which is what we want
-                    trace_patch["customdata"] = trace_data.get_column(attr_value)
+                    trace_patch["customdata"] = trace_data.select(attr_value)
             elif attr_name == "hover_name":
                 if trace_spec.constructor not in [
                     go.Histogram,
@@ -1381,33 +1382,46 @@ def build_dataframe(args, constructor):
 
     # Cast data_frame argument to DataFrame (it could be a numpy array, dict etc.)
     df_provided = args["data_frame"] is not None
+    original_frame = args["data_frame"]
 
     if df_provided:
-        if is_narwhals_eager_dataframe(args["data_frame"]):
+        if is_narwhals_eager_dataframe(original_frame):
             args["data_frame"] = nw.from_native(
-                args["data_frame"], strict=True, eager_only=True
+                original_frame, strict=True, eager_only=True
             )
         else:
-            if hasattr(args["data_frame"], "to_pandas"):
-                df_pandas = args["data_frame"].to_pandas()
-            elif hasattr(args["data_frame"], "toPandas"):
-                df_pandas = args["data_frame"].toPandas()
-            elif hasattr(args["data_frame"], "to_pandas_df"):
-                df_pandas = args["data_frame"].to_pandas_df()
+            if hasattr(original_frame, "to_pandas"):
+                df_pandas = original_frame.to_pandas()
+            elif hasattr(original_frame, "toPandas"):
+                df_pandas = original_frame.toPandas()
+            elif hasattr(original_frame, "to_pandas_df"):
+                df_pandas = original_frame.to_pandas_df()
             elif (
-                hasattr(args["data_frame"], "__dataframe__")
+                hasattr(original_frame, "__dataframe__")
                 and (pd := nw.dependencies.get_pandas()) is not None
                 and version.parse(pd.__version__) >= version.parse("2.0.2")
             ):
-                df_pandas = pd.api.interchange.from_dataframe(args["data_frame"])
+                df_pandas = pd.api.interchange.from_dataframe(original_frame)
             else:
-                # Cases in which data_frame can be given as input to dataframe
-                # constructor, e.g. a dict
-                df_pandas = pd.DataFrame(args["data_frame"])
+                if (pd := nw.dependencies.get_pandas()) is not None:
+                    # Cases in which data_frame can be given as input to dataframe
+                    # constructor, e.g. a dict
+                    df_pandas = pd.DataFrame(original_frame)
+                else:
+                    msg = f"Data of type {type(original_frame)} require pandas to be installed"
+                    raise ImportError(msg)
 
             args["data_frame"] = nw.from_native(df_pandas, strict=True, eager_only=True)
 
         columns = args["data_frame"].columns
+
+        if any(isinstance(c, tuple) for c in columns):
+            raise TypeError(
+                "Data frame columns is a pandas MultiIndex. "
+                "pandas MultiIndex is not supported by plotly express "
+                "at the moment."
+            )
+
     else:
         columns = None
 
@@ -1431,19 +1445,8 @@ def build_dataframe(args, constructor):
             )
         if df_provided and no_x and no_y:
             wide_mode = True
-            if (pd := nw.dependencies.get_pandas()) is not None and isinstance(
-                columns, pd.MultiIndex
-            ):
-                raise TypeError(
-                    "Data frame columns is a pandas MultiIndex. "
-                    "pandas MultiIndex is not supported by plotly express "
-                    "at the moment."
-                )
-            elif (pd := nw.dependencies.get_pandas()) is not None and isinstance(
-                columns, pd.Index
-            ):
-                # TODO: push this above, at this point we lose the pd.Index info as columns will be either a list or None
-                var_name = columns.name
+            if nw.dependencies.is_pandas_like_dataframe(original_frame):
+                var_name = original_frame.columns.name or None
             else:
                 var_name = None
 
@@ -1462,7 +1465,14 @@ def build_dataframe(args, constructor):
             args["wide_variable"] = args["y"] if wide_y else args["x"]
             if df_provided and args["wide_variable"] is columns:
                 var_name = None
-            if isinstance(args["wide_variable"], pd.Index):
+            if (
+                args["data_frame"] is not None
+                and hasattr(
+                    native_namespace := args["data_frame"].__native_namespace__(),
+                    "Index",
+                )
+                and isinstance(args["wide_variable"], native_namespace.Index)
+            ):
                 args["wide_variable"] = list(args["wide_variable"])
             if var_name in [None, "value", "index"] or (
                 df_provided and var_name in columns
@@ -1481,7 +1491,7 @@ def build_dataframe(args, constructor):
         value_name = _escape_col_name(columns, "value", [])
         var_name = _escape_col_name(columns, var_name, [])
 
-    df_input = args["data_frame"]  # TODO: What if not provided?!
+    df_input = args["data_frame"]
     index = nw.maybe_get_index(df_input) if df_provided else None
 
     missing_bar_dim = None
@@ -1492,7 +1502,7 @@ def build_dataframe(args, constructor):
         if not wide_mode and (no_x != no_y):
             for ax in ["x", "y"]:
                 if args.get(ax) is None:
-                    args[ax] = index or Range()
+                    args[ax] = index if index is not None else Range()
                     if constructor == go.Bar:
                         missing_bar_dim = ax
                     else:
@@ -1501,8 +1511,12 @@ def build_dataframe(args, constructor):
         if wide_mode and wide_cross_name is None:
             if no_x != no_y and args["orientation"] is None:
                 args["orientation"] = "v" if no_x else "h"
-            args["wide_cross"] = index or Range(
-                label=_escape_col_name(df_input, "index", [var_name, value_name])
+            args["wide_cross"] = (
+                index
+                if index is not None
+                else Range(
+                    label=_escape_col_name(df_input, "index", [var_name, value_name])
+                )
             )
 
     no_color = False
@@ -1680,10 +1694,6 @@ def process_dataframe_hierarchy(args):
 
     path = new_path
     # ------------ Define aggregation functions --------------------------------
-
-    def aggfunc_discrete(x):
-        return nw.col(x).unique()
-
     agg_f = {}
     aggfunc_color = None
     if args["values"]:
@@ -1713,65 +1723,123 @@ def process_dataframe_hierarchy(args):
         # we can modify df because it's a copy of the px argument
         df = df.with_columns(**{count_colname: nw.lit(1)})
         args["values"] = count_colname
+
+    # Since count_colname is always in aggs, then it can be used later to normalize color
+    # in the continuous case
     agg_f[count_colname] = nw.sum(count_colname)
+
     discrete_aggs = []
+    continuous_aggs = []
+
     if args["color"]:
         if not _is_continuous(df, args["color"]):
-            aggfunc_color = aggfunc_discrete(args["color"])
+
             discrete_aggs.append(args["color"])
             discrete_color = True
+
+            # TODO: In theory, we should have a way to do nw.col(x).unique() and
+            # successively do:
+            # nw.when(nw.col(x).list.len()==1).then(nw.col(x).list.first()).otherwise(nw.lit("(?)"))
+            # which replicates:
+            # ```
+            # uniques = x.unique()
+            # if len(uniques) == 1:
+            #     return uniques[0]
+            # else:
+            #     return "(?)"
+            # ```
+            # However we cannot do that just yet, therefore a workaround is provided
+            agg_f[args["color"]] = nw.col(args["color"]).max()
+            agg_f[f'{args["color"]}__n_unique__'] = (
+                nw.col(args["color"]).n_unique().alias(f'{args["color"]}__n_unique__')
+            )
         else:
+            # This first needs to be multiplied by `count_colname`
+            continuous_aggs.append(args["color"])
+            discrete_color = False
 
-            def aggfunc_continuous(x):
-                # TODO: Can this be made into a "simple" expression?
-                return (nw.col(x) * nw.col(count_colname)).sum() / nw.sum(count_colname)
-                return np.average(
-                    x, weights=df.loc[x.index, count_colname]
-                )  # Original function
-
-            aggfunc_color = aggfunc_continuous
-        agg_f[args["color"]] = aggfunc_color
+            agg_f[args["color"]] = nw.sum(args["color"])
 
     #  Other columns (for color, hover_data, custom_data etc.)
     cols = list(set(df.columns).difference(path))
     for col in cols:  # for hover_data, custom_data etc.
         if col not in agg_f:
             discrete_aggs.append(col)
-            agg_f[col] = aggfunc_discrete(args[col])
+            agg_f[col] = nw.col(col).max()
+            agg_f[f"{col}__n_unique__"] = (
+                nw.col(col).n_unique().alias(f"{col}__n_unique__")
+            )
 
     # Avoid collisions with reserved names - columns in the path have been copied already
     cols = list(set(cols) - set(["labels", "parent", "id"]))
     # ----------------------------------------------------------------------------
     all_trees = []
+
+    if not discrete_color:
+        df = df.with_columns(
+            **{args["color"]: nw.col(args["color"]) * nw.col(count_colname)}
+        )
+
+    def post_agg(
+        dframe: nw.DataFrame, continuous_aggs: list[str], discrete_aggs: list[str]
+    ) -> nw.DataFrame:
+        """
+        - continuous_aggs is either [] or [args["color"]]
+        - discrete_aggs is either [args["color"], <rest_of_cols>] or [<rest_of cols>]
+        """
+        return dframe.with_columns(
+            **{c: nw.col(c) / nw.col(count_colname) for c in continuous_aggs},
+            **{
+                c: nw.when(nw.col(f"{c}__n_unique__") == 1)
+                .then(nw.col(c))
+                .otherwise(nw.lit("(?)"))
+                for c in discrete_aggs
+            },
+        ).drop([f"{c}__n_unique__" for c in discrete_aggs])
+
     for i, level in enumerate(path):
 
-        dfg = df.group_by(path[i:]).agg(agg_f)
-
-        # TODO: The following logic is required for all discrete_aggs after aggregation
-        # if uniques.len() == 1:
-        #     return uniques[0]
-        # else:
-        #     return "(?)"
+        dfg = (
+            df.group_by(path[i:])
+            .agg(**agg_f)
+            .pipe(post_agg, continuous_aggs, discrete_aggs)
+        )
 
         # Path label massaging
-        df_tree = dfg.clone().select(
-            level=nw.col(level).cast(nw.String()),
+        df_tree = dfg.clone().with_columns(
+            *cols,
+            labels=nw.col(level).cast(nw.String()),
             parent=nw.lit(""),
             id=nw.col(level).cast(nw.String()),
         )
         if i < len(path) - 1:
             j = i + 1
+
+            # path_j_col = reduce(lambda c1, c2: c1 + "/" + c2, (dfg.get_column(path[j]).cast(nw.String()) for j in range(len(path)-1, j, -1)), "")
+            # parent_col = df_tree.get_column("parent").cast(nw.String())
+            # id_col = df_tree.get_column("id").cast(nw.String())
+
+            # df_tree = df_tree.with_columns(
+            #     **{
+            #         "parent": path_j_col + "/" + parent_col,
+            #         "id": path_j_col + "/" + id_col,
+            #     }
+            # )
+
             while j < len(path):
                 path_j_col = dfg.get_column(path[j]).cast(nw.String())
+                parent_col = df_tree.get_column("parent").cast(nw.String())
+                id_col = df_tree.get_column("id").cast(nw.String())
 
                 df_tree = df_tree.with_columns(
                     **{
-                        "parent": path_j_col + "/" + nw.col("parent"),
-                        "id": path_j_col + "/" + nw.col("id"),
+                        "parent": path_j_col + "/" + parent_col,
+                        "id": path_j_col + "/" + id_col,
                     }
                 )
                 j += 1
 
+            print(df_tree.to_native())
         df_tree = df_tree.with_columns(
             parent=nw.col("parent").str.replace(
                 "/?$", ""
@@ -1787,6 +1855,7 @@ def process_dataframe_hierarchy(args):
         sort_col_name = "sort_color_if_discrete_color"
         while sort_col_name in df_all_trees.columns:
             sort_col_name += "0"
+        # breakpoint()
         df_all_trees = df_all_trees.with_columns(
             **{sort_col_name: df[args["color"]].cast(nw.String())}
         ).sort(by=sort_col_name)
@@ -1805,6 +1874,8 @@ def process_dataframe_hierarchy(args):
                 args["hover_data"][args["color"]] = (True, None)
         else:
             args["hover_data"].append(args["color"])
+
+    print(args)
     return args
 
 
@@ -1826,11 +1897,6 @@ def process_dataframe_timeline(args):
         )
 
     # note that we are not adding any columns to the data frame here, so no risk of overwrite
-    # Original
-    # args["data_frame"][args["x_end"]] = (x_end - x_start).astype(
-    #     "timedelta64[ns]"
-    # ) / np.timedelta64(1, "ms")
-
     # TODO(FBruzzesi) Requires https://github.com/narwhals-dev/narwhals/pull/960 to be merged and released
     args["data_frame"] = df.with_columns(
         **{
@@ -1838,6 +1904,11 @@ def process_dataframe_timeline(args):
             / nw.lit(1).cast(nw.Duration("ms")),
         }
     )
+
+    # Original pandas version
+    # args["data_frame"][args["x_end"]] = (x_end - x_start).astype(
+    #     "timedelta64[ns]"
+    # ) / np.timedelta64(1, "ms")
 
     args["x"] = args["x_end"]
     del args["x_end"]
@@ -2169,7 +2240,6 @@ def make_figure(args, constructor, trace_patch=None, layout_patch=None):
     grouper = [x.grouper or one_group for x in grouped_mappings] or [one_group]
     groups, orders = get_groups_and_orders(args, grouper)
 
-    # TODO: Checkpoint
     col_labels = []
     row_labels = []
     nrows = ncols = 1
@@ -2325,7 +2395,7 @@ def make_figure(args, constructor, trace_patch=None, layout_patch=None):
                 group_sum = group.get_column(
                     var
                 ).sum()  # compute here before next line mutates
-                group = group.with_columns(**{var: nw.col(var).cumsum()})
+                group = group.with_columns(**{var: nw.col(var).cum_sum()})
                 if not ascending:
                     group = group.sort(by=base, descending=False)
 
@@ -2344,7 +2414,7 @@ def make_figure(args, constructor, trace_patch=None, layout_patch=None):
             patch, fit_results = make_trace_kwargs(
                 args, trace_spec, group, mapping_labels.copy(), sizeref
             )
-            # TODO: Checkpoint
+
             trace.update(patch)
             if fit_results is not None:
                 trendline_rows.append(mapping_labels.copy())
@@ -2454,8 +2524,10 @@ def make_figure(args, constructor, trace_patch=None, layout_patch=None):
         if fit_results is not None:
             trendline_rows.append(dict(px_fit_results=fit_results))
 
-    # TODO: Add trendline_rows
-    # fig._px_trendlines = pd.DataFrame(trendline_rows)
+    if pd := nw.dependencies.get_pandas():
+        fig._px_trendlines = pd.DataFrame(trendline_rows)
+
+    # fig._px_trendlines = nw.from_dict(trendline_rows)
 
     configure_axes(args, constructor, fig, orders)
     configure_animation_controls(args, constructor, fig)
