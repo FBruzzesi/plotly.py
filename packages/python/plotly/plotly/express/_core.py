@@ -275,8 +275,11 @@ def make_trace_kwargs(args, trace_spec, trace_data, mapping_labels, sizeref):
     fit_results : dict
         fit information to be used for trendlines
     """
+    df: nw.DataFrame = args["data_frame"]
+    trace_data: nw.DataFrame
+
     if "line_close" in args and args["line_close"]:
-        trace_data = pd.concat([trace_data, trace_data.iloc[:1]])
+        trace_data = nw.concat([trace_data, trace_data.head(1)], how="vertical")
     trace_patch = trace_spec.trace_patch.copy() or {}
     fit_results = None
     hover_header = ""
@@ -285,17 +288,14 @@ def make_trace_kwargs(args, trace_spec, trace_data, mapping_labels, sizeref):
         attr_label = get_decorated_label(args, attr_value, attr_name)
         if attr_name == "dimensions":
             dims = [
-                (name, column)
-                for (name, column) in trace_data.items()
+                (name, trace_data.get_column(name))
+                for name in trace_data.columns
                 if ((not attr_value) or (name in attr_value))
-                and (
-                    trace_spec.constructor != go.Parcoords
-                    or _is_continuous(args["data_frame"], name)
-                )
+                and (trace_spec.constructor != go.Parcoords or _is_continuous(df, name))
                 and (
                     trace_spec.constructor != go.Parcats
                     or (attr_value is not None and name in attr_value)
-                    or len(args["data_frame"][name].unique())
+                    or df.get_column(name).n_unique()
                     <= args["dimensions_max_cardinality"]
                 )
             ]
@@ -313,7 +313,7 @@ def make_trace_kwargs(args, trace_spec, trace_data, mapping_labels, sizeref):
             if attr_name == "size":
                 if "marker" not in trace_patch:
                     trace_patch["marker"] = dict()
-                trace_patch["marker"]["size"] = trace_data[attr_value]
+                trace_patch["marker"]["size"] = trace_data.get_column(attr_value)
                 trace_patch["marker"]["sizemode"] = "area"
                 trace_patch["marker"]["sizeref"] = sizeref
                 mapping_labels[attr_label] = "%{marker.size}"
@@ -327,12 +327,11 @@ def make_trace_kwargs(args, trace_spec, trace_data, mapping_labels, sizeref):
                 if (
                     args["x"]
                     and args["y"]
-                    and len(trace_data[[args["x"], args["y"]]].dropna()) > 1
+                    and len(trace_data.drop_nulls(subset=[args["x"], args["y"]])) > 1
                 ):
                     # sorting is bad but trace_specs with "trendline" have no other attrs
-                    sorted_trace_data = trace_data.sort_values(by=args["x"])
-                    y = sorted_trace_data[args["y"]].values
-                    x = sorted_trace_data[args["x"]].values
+                    sorted_trace_data = trace_data.sort(by=args["x"])
+                    y, x = sorted_trace_data.select(args["y"], args["x"]).to_numpy().T
 
                     if x.dtype.type == np.datetime64:
                         # convert to unix epoch seconds
@@ -361,16 +360,22 @@ def make_trace_kwargs(args, trace_spec, trace_data, mapping_labels, sizeref):
                     non_missing = np.logical_not(
                         np.logical_or(np.isnan(y), np.isnan(x))
                     )
-                    trace_patch["x"] = sorted_trace_data[args["x"]][non_missing]
+                    trace_patch["x"] = sorted_trace_data.filter(non_missing).select(
+                        args["x"]
+                    )
                     trendline_function = trendline_functions[attr_value]
-                    y_out, hover_header, fit_results = trendline_function(
+                    (
+                        y_out,
+                        hover_header,
+                        fit_results,
+                    ) = trendline_function(  # TODO: Trendline needs special attention
                         args["trendline_options"],
-                        sorted_trace_data[args["x"]],
-                        x,
-                        y,
+                        sorted_trace_data.get_column(args["x"]),  # narwhals series
+                        x,  # numpy array
+                        y,  # numpy array
                         args["x"],
                         args["y"],
-                        non_missing,
+                        non_missing,  # numpy array
                     )
                     assert len(y_out) == len(
                         trace_patch["x"]
@@ -383,19 +388,19 @@ def make_trace_kwargs(args, trace_spec, trace_data, mapping_labels, sizeref):
                 arr = "arrayminus" if attr_name.endswith("minus") else "array"
                 if error_xy not in trace_patch:
                     trace_patch[error_xy] = {}
-                trace_patch[error_xy][arr] = trace_data[attr_value]
+                trace_patch[error_xy][arr] = trace_data.get_column(attr_value)
             elif attr_name == "custom_data":
                 if len(attr_value) > 0:
                     # here we store a data frame in customdata, and it's serialized
                     # as a list of row lists, which is what we want
-                    trace_patch["customdata"] = trace_data[attr_value]
+                    trace_patch["customdata"] = trace_data.get_column(attr_value)
             elif attr_name == "hover_name":
                 if trace_spec.constructor not in [
                     go.Histogram,
                     go.Histogram2d,
                     go.Histogram2dContour,
                 ]:
-                    trace_patch["hovertext"] = trace_data[attr_value]
+                    trace_patch["hovertext"] = trace_data.get_column(attr_value)
                     if hover_header == "":
                         hover_header = "<b>%{hovertext}</b><br><br>"
             elif attr_name == "hover_data":
@@ -429,14 +434,14 @@ def make_trace_kwargs(args, trace_spec, trace_data, mapping_labels, sizeref):
                     if len(customdata_cols) > 0:
                         # here we store a data frame in customdata, and it's serialized
                         # as a list of row lists, which is what we want
-                        trace_patch["customdata"] = trace_data[customdata_cols]
+                        trace_patch["customdata"] = trace_data.select(*customdata_cols)
             elif attr_name == "color":
                 if trace_spec.constructor in [
                     go.Choropleth,
                     go.Choroplethmap,
                     go.Choroplethmapbox,
                 ]:
-                    trace_patch["z"] = trace_data[attr_value]
+                    trace_patch["z"] = trace_data.get_column(attr_value)
                     trace_patch["coloraxis"] = "coloraxis1"
                     mapping_labels[attr_label] = "%{z}"
                 elif trace_spec.constructor in [
@@ -450,7 +455,9 @@ def make_trace_kwargs(args, trace_spec, trace_data, mapping_labels, sizeref):
                         trace_patch["marker"] = dict()
 
                     if args.get("color_is_continuous"):
-                        trace_patch["marker"]["colors"] = trace_data[attr_value]
+                        trace_patch["marker"]["colors"] = trace_data.get_column(
+                            attr_value
+                        )
                         trace_patch["marker"]["coloraxis"] = "coloraxis1"
                         mapping_labels[attr_label] = "%{color}"
                     else:
@@ -459,7 +466,7 @@ def make_trace_kwargs(args, trace_spec, trace_data, mapping_labels, sizeref):
                             mapping = args["color_discrete_map"].copy()
                         else:
                             mapping = {}
-                        for cat in trace_data[attr_value]:
+                        for cat in trace_data.get_column(attr_value):
                             if mapping.get(cat) is None:
                                 mapping[cat] = args["color_discrete_sequence"][
                                     len(mapping) % len(args["color_discrete_sequence"])
@@ -471,24 +478,24 @@ def make_trace_kwargs(args, trace_spec, trace_data, mapping_labels, sizeref):
                         colorable = "line"
                     if colorable not in trace_patch:
                         trace_patch[colorable] = dict()
-                    trace_patch[colorable]["color"] = trace_data[attr_value]
+                    trace_patch[colorable]["color"] = trace_data.get_column(attr_value)
                     trace_patch[colorable]["coloraxis"] = "coloraxis1"
                     mapping_labels[attr_label] = "%%{%s.color}" % colorable
             elif attr_name == "animation_group":
-                trace_patch["ids"] = trace_data[attr_value]
+                trace_patch["ids"] = trace_data.get_column(attr_value)
             elif attr_name == "locations":
-                trace_patch[attr_name] = trace_data[attr_value]
+                trace_patch[attr_name] = trace_data.get_column(attr_value)
                 mapping_labels[attr_label] = "%{location}"
             elif attr_name == "values":
-                trace_patch[attr_name] = trace_data[attr_value]
+                trace_patch[attr_name] = trace_data.get_column(attr_value)
                 _label = "value" if attr_label == "values" else attr_label
                 mapping_labels[_label] = "%{value}"
             elif attr_name == "parents":
-                trace_patch[attr_name] = trace_data[attr_value]
+                trace_patch[attr_name] = trace_data.get_column(attr_value)
                 _label = "parent" if attr_label == "parents" else attr_label
                 mapping_labels[_label] = "%{parent}"
             elif attr_name == "ids":
-                trace_patch[attr_name] = trace_data[attr_value]
+                trace_patch[attr_name] = trace_data.get_column(attr_value)
                 _label = "id" if attr_label == "ids" else attr_label
                 mapping_labels[_label] = "%{id}"
             elif attr_name == "names":
@@ -499,13 +506,13 @@ def make_trace_kwargs(args, trace_spec, trace_data, mapping_labels, sizeref):
                     go.Pie,
                     go.Funnelarea,
                 ]:
-                    trace_patch["labels"] = trace_data[attr_value]
+                    trace_patch["labels"] = trace_data.get_column(attr_value)
                     _label = "label" if attr_label == "names" else attr_label
                     mapping_labels[_label] = "%{label}"
                 else:
-                    trace_patch[attr_name] = trace_data[attr_value]
+                    trace_patch[attr_name] = trace_data.get_column(attr_value)
             else:
-                trace_patch[attr_name] = trace_data[attr_value]
+                trace_patch[attr_name] = trace_data.get_column(attr_value)
                 mapping_labels[attr_label] = "%%{%s}" % attr_name
         elif (trace_spec.constructor == go.Histogram and attr_name in ["x", "y"]) or (
             trace_spec.constructor in [go.Histogram2d, go.Histogram2dContour]
@@ -834,12 +841,13 @@ def configure_animation_controls(args, constructor, fig):
 
 
 def make_trace_spec(args, constructor, attrs, trace_patch):
+    df: nw.DataFrame = args["data_frame"]
     if constructor in [go.Scatter, go.Scatterpolar]:
         if "render_mode" in args and (
             args["render_mode"] == "webgl"
             or (
                 args["render_mode"] == "auto"
-                and len(args["data_frame"]) > 1000
+                and len(df) > 1000
                 and args.get("line_shape") != "spline"
                 and args["animation_frame"] is None
             )
@@ -1664,7 +1672,7 @@ def process_dataframe_hierarchy(args):
     """
     Build dataframe for sunburst, treemap, or icicle when the path argument is provided.
     """
-    df = args["data_frame"]
+    df: nw.DataFrame = args["data_frame"]
     path = args["path"][::-1]
     _check_dataframe_all_leaves(df[path[::-1]])
     discrete_color = False
@@ -1681,11 +1689,7 @@ def process_dataframe_hierarchy(args):
     # ------------ Define aggregation functions --------------------------------
 
     def aggfunc_discrete(x):
-        uniques = nw.col(x).unique()
-        if uniques.len() == 1:
-            return uniques[0]
-        else:
-            return "(?)"
+        return nw.col(x).unique()
 
     agg_f = {}
     aggfunc_color = None
@@ -1721,15 +1725,14 @@ def process_dataframe_hierarchy(args):
     discrete_aggs = []
     if args["color"]:
         if not _is_continuous(df, args["color"]):
-            aggfunc_color = nw.col(args["color"]).unique()
+            aggfunc_color = aggfunc_discrete(args["color"])
             discrete_aggs.append(args["color"])
             discrete_color = True
         else:
 
             def aggfunc_continuous(x):
-                return np.average(
-                    x, weights=df.loc[x.index, count_colname]
-                )  # TODO: Replicate in polars/narwhals
+                # TODO: Make this as an expression
+                return np.average(x, weights=df.loc[x.index, count_colname])
                 return np.average(
                     x, weights=df.filter(x).get_colum(count_colname).to_numpy()
                 )
@@ -1742,7 +1745,7 @@ def process_dataframe_hierarchy(args):
     for col in cols:  # for hover_data, custom_data etc.
         if col not in agg_f:
             discrete_aggs.append(col)
-            agg_f[col] = nw.col(args[col]).unique()
+            agg_f[col] = aggfunc_discrete(args[col])
 
     # TODO: this block requires some attention
     # Avoid collisions with reserved names - columns in the path have been copied already
@@ -1751,11 +1754,16 @@ def process_dataframe_hierarchy(args):
     all_trees = []
     for i, level in enumerate(path):
 
-        # TODO: Fix continuous, fix discrete
         dfg = df.group_by(path[i:]).agg(agg_f)
 
+        # TODO: The following logic is required for all discrete_aggs after aggregation
+        # if uniques.len() == 1:
+        #     return uniques[0]
+        # else:
+        #     return "(?)"
+
         # Path label massaging
-        df_tree = dfg.copy().select(
+        df_tree = dfg.clone().select(  # TODO: Is `clone()` needed?
             level=nw.col(level).cast(nw.String()),
             parent=nw.lit(""),
             id=nw.col(level).cast(nw.String()),
@@ -1773,7 +1781,7 @@ def process_dataframe_hierarchy(args):
 
         df_tree["parent"] = df_tree["parent"].str.rstrip(
             "/"
-        )  # TODO: not available(yet)
+        )  #  TODO: not available(yet)
 
         all_trees.append(df_tree.select(*["labels", "parent", "id", *cols]))
 
@@ -1814,17 +1822,28 @@ def process_dataframe_timeline(args):
         raise ValueError("Both x_start and x_end are required")
 
     try:
-        x_start = pd.to_datetime(args["data_frame"][args["x_start"]])
-        x_end = pd.to_datetime(args["data_frame"][args["x_end"]])
+        df: nw.DataFrame = args["data_frame"]
+        x_start = df.get_column([args["x_start"]]).cast(nw.Datetime())
+        x_end = df.get_column(args["x_end"]).cast(nw.Datetime())
     except (ValueError, TypeError):
         raise TypeError(
             "Both x_start and x_end must refer to data convertible to datetimes."
         )
 
     # note that we are not adding any columns to the data frame here, so no risk of overwrite
-    args["data_frame"][args["x_end"]] = (x_end - x_start).astype(
-        "timedelta64[ns]"
-    ) / np.timedelta64(1, "ms")
+    # Original
+    # args["data_frame"][args["x_end"]] = (x_end - x_start).astype(
+    #     "timedelta64[ns]"
+    # ) / np.timedelta64(1, "ms")
+
+    # TODO: Does this work for all backends?
+    df = df.with_columns(
+        **{
+            args["x_end"]: (x_end - x_start).cast(nw.Duration("ns"))
+            / np.timedelta64(1, "ms")
+        }
+    )
+
     args["x"] = args["x_end"]
     del args["x_end"]
     args["base"] = args["x_start"]
@@ -1839,12 +1858,12 @@ def process_dataframe_pie(args, trace_patch):
     order_in = args["category_orders"].get(names, {}).copy()
     if not order_in:
         return args, trace_patch
-    df = args["data_frame"]
+    df: nw.DataFrame = args["data_frame"]
     trace_patch["sort"] = False
     trace_patch["direction"] = "clockwise"
-    uniques = list(df[names].unique())
+    uniques = list(df[names].unique())  # TODO: Understand what `names` can be
     order = [x for x in OrderedDict.fromkeys(list(order_in) + uniques) if x in uniques]
-    args["data_frame"] = df.set_index(names).loc[order].reset_index()
+    args["data_frame"] = df.select(*[names, *order])
     return args, trace_patch
 
 
@@ -1852,12 +1871,11 @@ def infer_config(args, constructor, trace_patch, layout_patch):
     attrs = [k for k in direct_attrables + array_attrables if k in args]
     grouped_attrs = []
 
+    df: nw.DataFrame = args["data_frame"]
     # Compute sizeref
     sizeref = 0
     if "size" in args and args["size"]:
-        sizeref = (
-            args["data_frame"].get_columns(args["size"]).max() / args["size_max"] ** 2
-        )
+        sizeref = df.get_column(args["size"]).max() / args["size_max"] ** 2
 
     # Compute color attributes and grouping attributes
     if "color" in args:
@@ -1865,7 +1883,7 @@ def infer_config(args, constructor, trace_patch, layout_patch):
             if "color_discrete_sequence" not in args:
                 attrs.append("color")
             else:
-                if args["color"] and _is_continuous(args["data_frame"], args["color"]):
+                if args["color"] and _is_continuous(df, args["color"]):
                     attrs.append("color")
                     args["color_is_continuous"] = True
                 elif constructor in [go.Sunburst, go.Treemap, go.Icicle]:
@@ -1920,8 +1938,8 @@ def infer_config(args, constructor, trace_patch, layout_patch):
                     args["orientation"] = "h"
 
         if args["orientation"] is None and has_x and has_y:
-            x_is_continuous = _is_continuous(args["data_frame"], args["x"])
-            y_is_continuous = _is_continuous(args["data_frame"], args["y"])
+            x_is_continuous = _is_continuous(df, args["x"])
+            y_is_continuous = _is_continuous(df, args["y"])
             if x_is_continuous and not y_is_continuous:
                 args["orientation"] = "h"
             if y_is_continuous and not x_is_continuous:
@@ -2029,7 +2047,7 @@ def infer_config(args, constructor, trace_patch, layout_patch):
         args[other_position] = None
 
     # Ignore facet rows and columns when data frame is empty so as to prevent nrows/ncols equaling 0
-    if args["data_frame"].is_empty():
+    if df.is_empty():
         args["facet_row"] = args["facet_col"] = None
 
     # If both marginals and faceting are specified, faceting wins
@@ -2090,7 +2108,7 @@ def get_groups_and_orders(args, grouper):
     of a single dimension-group
     """
     orders = {} if "category_orders" not in args else args["category_orders"].copy()
-
+    df: nw.DataFrame = args["data_frame"]
     # figure out orders and what the single group name would be if there were one
     single_group_name = []
     unique_cache = dict()
@@ -2099,7 +2117,7 @@ def get_groups_and_orders(args, grouper):
             single_group_name.append("")
         else:
             if col not in unique_cache:
-                unique_cache[col] = list(args["data_frame"][col].unique())
+                unique_cache[col] = df.get_column(col).unique().to_list()
             uniques = unique_cache[col]
             if len(uniques) == 1:
                 single_group_name.append(uniques[0])
@@ -2107,19 +2125,16 @@ def get_groups_and_orders(args, grouper):
                 orders[col] = uniques
             else:
                 orders[col] = list(OrderedDict.fromkeys(list(orders[col]) + uniques))
-    df = args["data_frame"]
+
     if len(single_group_name) == len(grouper):
         # we have a single group, so we can skip all group-by operations!
         groups = {tuple(single_group_name): df}
     else:
         required_grouper = [g for g in grouper if g != one_group]
-        grouped = df.groupby(
-            required_grouper, sort=False, observed=True
-        )  # skip one_group groupers
-        group_indices = grouped.indices
-        sorted_group_names = [
-            g if len(required_grouper) != 1 else (g,) for g in group_indices
-        ]
+        grouped = dict(
+            df.group_by(required_grouper).__iter__()
+        )  # TODO: may require to have `observed=False` for pandas
+        sorted_group_names = list(grouped.keys())
 
         for i, col in reversed(list(enumerate(required_grouper))):
             sorted_group_names = sorted(
@@ -2137,13 +2152,15 @@ def get_groups_and_orders(args, grouper):
 
         groups = {}
         for sf, s in zip(full_sorted_group_names, sorted_group_names):
+
+            # TODO: Check consistency we have in narwhals
             if len(s) > 1:
-                groups[sf] = grouped.get_group(s)
+                groups[sf] = grouped[s]
             else:
                 if pandas_2_2_0:
-                    groups[sf] = grouped.get_group((s[0],))
+                    groups[sf] = grouped[(s[0],)]
                 else:
-                    groups[sf] = grouped.get_group(s[0])
+                    groups[sf] = grouped[s[0]]
     return groups, orders
 
 
@@ -2167,6 +2184,7 @@ def make_figure(args, constructor, trace_patch=None, layout_patch=None):
     grouper = [x.grouper or one_group for x in grouped_mappings] or [one_group]
     groups, orders = get_groups_and_orders(args, grouper)
 
+    # TODO: Checkpoint
     col_labels = []
     row_labels = []
     nrows = ncols = 1
@@ -2318,23 +2336,31 @@ def make_figure(args, constructor, trace_patch=None, layout_patch=None):
                 base = args["x"] if args["orientation"] == "v" else args["y"]
                 var = args["x"] if args["orientation"] == "h" else args["y"]
                 ascending = args.get("ecdfmode", "standard") != "reversed"
-                group = group.sort_values(by=base, ascending=ascending)
-                group_sum = group[var].sum()  # compute here before next line mutates
-                group[var] = group[var].cumsum()
+                group = group.sort(by=base, descending=not ascending)
+                group_sum = group.get_column(
+                    var
+                ).sum()  # compute here before next line mutates
+                group = group.with_columns(**{var: nw.col(var).cumsum()})
                 if not ascending:
-                    group = group.sort_values(by=base, ascending=True)
+                    group = group.sort(by=base, descending=False)
 
                 if args.get("ecdfmode", "standard") == "complementary":
-                    group[var] = group_sum - group[var]
+                    # TODO: Check if there is issue with having lit on the leftmost side
+                    group = group.with_columns(
+                        **{var: -nw.col(var) + nw.lit(group_sum)}
+                    )
 
                 if args["ecdfnorm"] == "probability":
-                    group[var] = group[var] / group_sum
+                    group = group.with_columns(**{var: nw.col(var) / nw.lit(group_sum)})
                 elif args["ecdfnorm"] == "percent":
-                    group[var] = 100.0 * group[var] / group_sum
+                    group = group.with_columns(
+                        **{var: nw.col(var) / nw.lit(group_sum) * nw.lit(100.0)}
+                    )
 
             patch, fit_results = make_trace_kwargs(
                 args, trace_spec, group, mapping_labels.copy(), sizeref
             )
+            # TODO: Checkpoint
             trace.update(patch)
             if fit_results is not None:
                 trendline_rows.append(mapping_labels.copy())
