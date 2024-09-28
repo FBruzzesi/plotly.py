@@ -1265,14 +1265,16 @@ def process_args_into_dataframe(args, wide_mode, var_name, value_name):
                         if argument == "index":
                             err_msg += "\n To use the index, pass it in directly as `df.index`."
                         raise ValueError(err_msg)
-                elif length and len(df_input.select(argument)) != length:
+                elif (
+                    length and (actual_len := len(df_input.select(argument))) != length
+                ):
                     raise ValueError(
                         "All arguments should have the same length. "
                         "The length of column argument `df[%s]` is %d, whereas the "
                         "length of  previously-processed arguments %s is %d"
                         % (
                             field,
-                            len(df_input[argument]),
+                            actual_len,
                             str(list(df_output.keys())),
                             length,
                         )
@@ -1396,10 +1398,16 @@ def build_dataframe(args, constructor):
     original_frame = args["data_frame"]
 
     if df_provided:
-        if is_narwhals_eager_dataframe(original_frame):
+        if is_into_eager_dataframe(original_frame):
             args["data_frame"] = nw.from_native(
                 original_frame, strict=True, eager_only=True
             )
+        elif is_into_series(original_frame):
+            args["data_frame"] = nw.from_native(
+                original_frame,
+                strict=True,
+                series_only=True,
+            ).to_frame()
         else:
             if hasattr(original_frame, "to_pandas"):
                 df_pandas = original_frame.to_pandas()
@@ -1422,7 +1430,9 @@ def build_dataframe(args, constructor):
                     msg = f"Data of type {type(original_frame)} require pandas to be installed"
                     raise ImportError(msg)
 
-            args["data_frame"] = nw.from_native(df_pandas, strict=True, eager_only=True)
+            args["data_frame"] = nw.from_native(
+                df_pandas, strict=True, eager_only=True, allow_series=True
+            )
 
         columns = args["data_frame"].columns
 
@@ -2633,10 +2643,19 @@ Use the {facet_arg} argument to adjust this spacing.""".format(
     return fig
 
 
-def is_narwhals_eager_dataframe(df) -> bool:
+def is_into_eager_dataframe(df) -> bool:
     """Check if `df` is a supported narwhals eager dataframe."""
     return (
         nw.dependencies.is_polars_dataframe(df)
         or nw.dependencies.is_pyarrow_table(df)
         or nw.dependencies.is_pandas_like_dataframe(df)
+    )
+
+
+def is_into_series(df) -> bool:
+    """Check if `df` is a supported narwhals eager dataframe."""
+    return (
+        nw.dependencies.is_polars_series(df)
+        or nw.dependencies.is_pyarrow_chunked_array(df)
+        or nw.dependencies.is_pandas_like_series(df)
     )
