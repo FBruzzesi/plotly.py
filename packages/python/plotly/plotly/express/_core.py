@@ -324,12 +324,16 @@ def make_trace_kwargs(args, trace_spec, trace_data, mapping_labels, sizeref):
                 if (
                     args["x"]
                     and args["y"]
-                    and len(trace_data.drop_nulls(subset=[args["x"], args["y"]])) > 1
+                    and len(
+                        trace_data.select(nw.col(args["x"], args["y"])).drop_nulls()
+                    )
+                    > 1
                 ):
                     # sorting is bad but trace_specs with "trendline" have no other attrs
                     sorted_trace_data = trace_data.sort(by=args["x"])
-                    y, x = sorted_trace_data.select(args["y"], args["x"]).to_numpy().T
-
+                    y = sorted_trace_data.select(nw.col(args["y"])).to_numpy().squeeze()
+                    x = sorted_trace_data.get_column(args["x"]).to_numpy()
+                    # TODO: Fix dtype
                     if x.dtype.type == np.datetime64:
                         # convert to unix epoch seconds
                         x = x.astype(np.int64) / 10**9
@@ -357,8 +361,8 @@ def make_trace_kwargs(args, trace_spec, trace_data, mapping_labels, sizeref):
                     non_missing = np.logical_not(
                         np.logical_or(np.isnan(y), np.isnan(x))
                     )
-                    trace_patch["x"] = sorted_trace_data.filter(non_missing).select(
-                        args["x"]
+                    trace_patch["x"] = sorted_trace_data[non_missing].select(
+                        nw.col(args["x"])
                     )
                     trendline_function = trendline_functions[attr_value]
                     y_out, hover_header, fit_results = trendline_function(
@@ -1110,9 +1114,7 @@ def to_unindexed_series(x, name=None):
     required to get things to match up right in the new DataFrame we're building
     """
     if nw.dependencies.is_pandas_like_series(x):
-        return nw.from_native(
-            x.to_native().rename(name).reset_index(drop=True), series_only=True
-        )
+        return nw.from_native(x.rename(name).reset_index(drop=True), series_only=True)
     elif isinstance(x, nw.Series):
         return x
     else:
@@ -1130,7 +1132,7 @@ def process_args_into_dataframe(args, wide_mode, var_name, value_name):
     reference.
     """
 
-    df_input = args["data_frame"]
+    df_input: nw.DataFrame = args["data_frame"]
     df_provided = df_input is not None
 
     # we use a dict instead of a dataframe directly so that it doesn't cause
@@ -1208,6 +1210,7 @@ def process_args_into_dataframe(args, wide_mode, var_name, value_name):
                     "at the moment." % field
                 )
             # ----------------- argument is a special value ----------------------
+            # breakpoint()
             if isinstance(argument, (Constant, Range)):
                 col_name = _check_name_not_reserved(
                     str(argument.label) if argument.label is not None else field,
@@ -1251,7 +1254,7 @@ def process_args_into_dataframe(args, wide_mode, var_name, value_name):
                     )
                 # Check validity of column name
                 elif argument not in df_input.columns:
-                    if wide_mode and argument in (value_name, var_name):
+                    if wide_mode and argument in {value_name, var_name}:
                         continue
                     else:
                         err_msg = (
@@ -1262,7 +1265,7 @@ def process_args_into_dataframe(args, wide_mode, var_name, value_name):
                         if argument == "index":
                             err_msg += "\n To use the index, pass it in directly as `df.index`."
                         raise ValueError(err_msg)
-                elif length and len(df_input[argument]) != length:
+                elif length and len(df_input.select(argument)) != length:
                     raise ValueError(
                         "All arguments should have the same length. "
                         "The length of column argument `df[%s]` is %d, whereas the "
@@ -1331,7 +1334,9 @@ def process_args_into_dataframe(args, wide_mode, var_name, value_name):
             col_name: nw.new_series(
                 name=col_name,
                 values=range(length),
-                native_namespace=df_input.__native_namespace__(),
+                native_namespace=df_input.__native_namespace__()
+                if df_provided
+                else nw.dependencies.get_pandas(),
             )
             for col_name in ranges
         }
@@ -1342,13 +1347,19 @@ def process_args_into_dataframe(args, wide_mode, var_name, value_name):
             col_name: nw.new_series(
                 name=col_name,
                 values=[constants[col_name]] * length,
-                native_namespace=df_input.__native_namespace__(),
+                native_namespace=df_input.__native_namespace__()
+                if df_provided
+                else nw.dependencies.get_pandas(),
             )
             for col_name in constants
         }
     )
 
-    df_output = nw.from_dict(df_output)
+    if df_output:
+        df_output = nw.from_dict(df_output)
+    else:
+        pd = nw.dependencies.get_pandas()
+        df_output = nw.from_native(pd.DataFrame({}), eager_only=True)
     return df_output, wide_id_vars
 
 
@@ -1897,18 +1908,9 @@ def process_dataframe_timeline(args):
         )
 
     # note that we are not adding any columns to the data frame here, so no risk of overwrite
-    # TODO(FBruzzesi) Requires https://github.com/narwhals-dev/narwhals/pull/960 to be merged and released
     args["data_frame"] = df.with_columns(
-        **{
-            args["x_end"]: (x_end - x_start).cast(nw.Duration("ns"))
-            / nw.lit(1).cast(nw.Duration("ms")),
-        }
+        **{args["x_end"]: (x_end - x_start).cast(nw.Duration()).dt.total_milliseconds()}
     )
-
-    # Original pandas version
-    # args["data_frame"][args["x_end"]] = (x_end - x_start).astype(
-    #     "timedelta64[ns]"
-    # ) / np.timedelta64(1, "ms")
 
     args["x"] = args["x_end"]
     del args["x_end"]
