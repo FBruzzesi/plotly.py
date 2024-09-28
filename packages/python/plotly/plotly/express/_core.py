@@ -1783,6 +1783,9 @@ def process_dataframe_hierarchy(args):
 
     #  Other columns (for color, hover_data, custom_data etc.)
     cols = list(set(df.columns).difference(path))
+    df = df.with_columns(
+        **{c: nw.col(c).cast(nw.String()) for c in cols if c not in agg_f}
+    )
     for col in cols:  # for hover_data, custom_data etc.
         if col not in agg_f:
             discrete_aggs.append(col)
@@ -1796,7 +1799,7 @@ def process_dataframe_hierarchy(args):
     # ----------------------------------------------------------------------------
     all_trees = []
 
-    if not discrete_color:
+    if args["color"] and not discrete_color:
         df = df.with_columns(
             **{args["color"]: nw.col(args["color"]) * nw.col(count_colname)}
         )
@@ -1811,7 +1814,7 @@ def process_dataframe_hierarchy(args):
         return dframe.with_columns(
             **{c: nw.col(c) / nw.col(count_colname) for c in continuous_aggs},
             **{
-                c: nw.when(nw.col(f"{c}__n_unique__") == 1)
+                c: nw.when(nw.col(f"{c}__n_unique__") == nw.lit(1))
                 .then(nw.col(c))
                 .otherwise(nw.lit("(?)"))
                 for c in discrete_aggs
