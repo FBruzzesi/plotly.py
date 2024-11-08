@@ -2160,10 +2160,17 @@ def process_dataframe_pie(args, trace_patch):
     uniques = df.get_column(names).unique().to_list()
     order = [x for x in OrderedDict.fromkeys(list(order_in) + uniques) if x in uniques]
 
-    # Original implementation: args["data_frame"] = df.set_index(names).loc[order].reset_index()
-    # However we do not have a way to custom sort a dataframe in narwhals.
-    args["data_frame"] = nw.concat(
-        [df.filter(nw.col(names) == value) for value in order], how="vertical"
+    # Sort args['data_frame'] by column 'b' according to order `order`.
+    token = nw.generate_temporary_column_name(8, args["data_frame"].columns)
+    args["data_frame"] = (
+        args["data_frame"]
+        .with_columns(
+            nw.col("b")
+            .replace_strict(order, range(len(order)), return_dtype=nw.UInt32)
+            .alias(token)
+        )
+        .sort(token)
+        .drop(token)
     )
     return args, trace_patch
 
@@ -2420,7 +2427,9 @@ def get_groups_and_orders(args, grouper):
             single_group_name.append("")
         else:
             if col not in unique_cache:
-                unique_cache[col] = df.get_column(col).unique().to_list()
+                unique_cache[col] = (
+                    df.get_column(col).unique(maintain_order=True).to_list()
+                )
             uniques = unique_cache[col]
             if len(uniques) == 1:
                 single_group_name.append(uniques[0])
