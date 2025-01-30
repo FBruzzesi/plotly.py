@@ -56,6 +56,32 @@ def test_pie_like_px():
     _compare_figures(trace, fig)
 
 
+def test_pie_with_category_orders(constructor):
+    data = {
+        "status": ["On Route", "Pending", "Waiting Result", "Delivered"],
+        "count": [28, 10, 73, 8]
+    }
+    custom_order = ["Pending", "Waiting Result", "On Route", "Delivered",]
+
+    df = constructor(data)
+
+    fig = px.pie(
+        data_frame=df,
+        values="count",
+        names="status",
+        category_orders={"status": custom_order},
+    )
+
+    values_ = np.array([
+        x[0] for x in sorted(zip(data["count"], data["status"]), key=lambda t: custom_order.index(t[1]))
+    ])
+    trace = go.Pie(
+        values=values_,
+        labels=custom_order,
+    )
+    _compare_figures(trace, fig)
+
+
 def test_sunburst_treemap_colorscales():
     labels = ["Eve", "Cain", "Seth", "Enos", "Noam", "Abel", "Awan", "Enoch", "Azura"]
     parents = ["", "Eve", "Eve", "Seth", "Seth", "Eve", "Eve", "Awan", "Eve"]
