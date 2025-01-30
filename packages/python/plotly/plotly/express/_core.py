@@ -2163,8 +2163,8 @@ def process_dataframe_pie(args, trace_patch):
     token = nw.generate_temporary_column_name(8, df.columns)
     args["data_frame"] = (
         df.with_columns(
-            nw.col("b")
-            .replace_strict(order, range(len(order)), return_dtype=nw.UInt32)
+            nw.col(names)
+            .replace_strict(order, range(len(order)), return_dtype=nw.UInt32())
             .alias(token)
         )
         .sort(token)
